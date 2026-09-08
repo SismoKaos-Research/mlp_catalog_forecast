@@ -1,17 +1,35 @@
 [project]
 name = "forecast"
 version = "0.1.0"
-description = "Add your description here"
+description = "catalog_mlp: forecasting M>=threshold within a horizon, from earthquake-catalogue features alone"
 readme = "README.md"
 authors = [
     { name = "Oguzb", email = "hoguzbolat@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+# The catalogue is the only input: no waveform archive, no miniSEED, no
+# spectrograms. That is the finding this project is built on, and it is why the
+# dependency list is this short.
+dependencies = [
+    "torch>=2.14.0",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scikit-learn>=1.5",
+]
 
 [project.scripts]
-forecast = "forecast:main"
+forecast = "forecast.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The failures this suite exists to catch are quiet ones -- a label that leaks
+# across a fold boundary, a floor that was never computed -- so warnings are
+# signal here, not noise.
+addopts = "-ra --strict-markers"
