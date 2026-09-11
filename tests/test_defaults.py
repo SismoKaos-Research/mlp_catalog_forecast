@@ -81,6 +81,32 @@ def test_the_waveform_flags_are_gone(defaults):
         assert gone not in defaults, f"--{gone.replace('_', '-')} should not exist here"
 
 
+def test_the_study_region_defaults_to_the_published_one(defaults):
+    """Naming no region has to mean the Aegean box every published number was
+    produced over -- a default region that drifted would be a different model
+    reported under the same name, and nothing would raise."""
+    assert defaults["catalog_bbox"] is None
+    assert defaults["catalog_radius"] is None
+    assert defaults["station_radius"] is None
+    assert defaults["station_catalog"] is None
+
+
+def test_sampling_defaults_to_every_hour(defaults):
+    """Every published number was produced one-sample-per-hour. A stride that
+    drifted off 1 would silently rescale every n in the report."""
+    assert defaults["train_stride_hours"] == 1
+    assert defaults["eval_stride_hours"] == 1
+
+
+def test_the_station_flags_are_gone(defaults):
+    """They cut the catalogue down to events near a seismometer, and no
+    seismometer is read here -- so they narrowed the M>=4.5 set, already ~10^2
+    events, in exchange for nothing. The spatial holdout that does mean
+    something for a region-wide branch is --region-split."""
+    for gone in ("stations", "max_station_dist_km"):
+        assert gone not in defaults, f"--{gone.replace('_', '-')} should not exist here"
+
+
 def test_detect_is_not_an_offered_label_mode():
     """It needs the waveform branch: its label is a threshold on dsp, which the
     catalogue branch carries, so it would score ~1.0 by construction."""

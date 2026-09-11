@@ -8,17 +8,31 @@ persistence floor, and concluded that "the forecasting signal in this project
 comes from the earthquake catalogue, not from the seismogram." What survived
 that boundary is what this module reads.
 
-Ported from `cnn_earthquake/src/sismokaos/catalog.py` -- the seven functions
+Ported from `cnn_earthquake/src/sismokaos/catalog.py` -- the five functions
 catalog_mlp uses, of its twenty. Bodies are unchanged; they produced the
 published figures.
+
+The station-distance filter came across with them and is gone: it existed to cut
+the catalogue down to events near a seismometer whose waveforms the model read,
+and nothing here reads a waveform, so it narrowed the catalogue for a reason that
+had stopped existing. What stands in its place is `Region` -- the patch of crust
+a run is about, stated by the user and agreed on by everything downstream:
+features, labels, the floor and the folds. `stations.py` can name one by station
+code, which is a lookup for the centre of a disc and not a return of the filter.
 """
+from dataclasses import dataclass
+from functools import lru_cache
+
 import numpy as np
 import pandas as pd
 
 # lat0, lat1, lon0, lon1
 AEGEAN_BBOX = (36.0, 40.0, 25.0, 30.0)
 
-STATION_COORDS = {"BODT": (37.0622, 27.3103), "DAT": (36.7308, 27.5767)}
+# One degree of latitude, in km. Only ever used to put a box around a disc, so
+# the flattening term the geodesic would add is far below the resolution of
+# anything downstream (the entropy grid is 10 cells across a 4-degree box).
+KM_PER_DEG_LAT = 111.195
 
 
 def haversine_km(lat0: float, lon0: float, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
@@ -29,33 +43,153 @@ def haversine_km(lat0: float, lon0: float, lats: np.ndarray, lons: np.ndarray) -
     a = np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2
     return 2 * r * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
 
-def station_distance_mask(lats: np.ndarray, lons: np.ndarray, stations, max_dist_km: float):
-    """Boolean mask for events within `max_dist_km` of the NEAREST named station."""
-    if not max_dist_km or max_dist_km <= 0:
-        return np.ones(len(lats), dtype=bool)
-    best = None
-    for s in stations:
-        lat, lon = STATION_COORDS[s] if isinstance(s, str) else s
-        d = haversine_km(lat, lon, lats, lons)
-        best = d if best is None else np.minimum(best, d)
-    return best <= max_dist_km
+
+@dataclass(frozen=True)
+class Region:
+    """The patch of crust a run is about: a box, or a disc around a point.
+
+    The default is the Aegean box every published number was produced over.
+    Narrowing it is a real decision rather than a filter, because it changes
+    the question: features, labels, the persistence floor and the folds are all
+    computed from the events inside, so a run over a 50km disc is forecasting a
+    different thing than a run over the Aegean, not the same thing more
+    precisely. It is also not free -- the M>=4.5 set is ~10^2 events across the
+    whole box -- which is why `train.py` prints what a narrowed region left it.
+
+    `bbox` is carried even for a disc, as the smallest box containing it. The
+    spatial Shannon entropy feature bins events into a fixed 10x10 grid, and a
+    grid still spanning the whole Aegean would drop a narrowed region's events
+    into two or three cells and report the same near-constant entropy every
+    hour.
+    """
+
+    bbox: tuple
+    center: tuple = None
+    radius_km: float = None
+    station: str = None
+
+    @classmethod
+    def from_flags(cls, bbox=None, radius=None):
+        """Builds the region named by `--catalog-bbox` / `--catalog-radius`.
+
+        Args:
+            bbox: Optional (lat0, lat1, lon0, lon1).
+            radius: Optional (lat, lon, km) disc.
+
+        Returns:
+            The named `Region`, or the Aegean default if neither was given.
+
+        Raises:
+            SystemExit: If the box is inside out or the disc has no size --
+                both of which otherwise produce an empty catalogue and a run
+                that fails much later, somewhere less informative.
+        """
+        if bbox and radius:
+            raise SystemExit("[ERROR] --catalog-bbox and --catalog-radius name two "
+                             "different regions; pass one.")
+        if bbox:
+            lat0, lat1, lon0, lon1 = (float(v) for v in bbox)
+            if lat0 >= lat1 or lon0 >= lon1:
+                raise SystemExit(f"[ERROR] --catalog-bbox {lat0} {lat1} {lon0} {lon1} "
+                                 f"is inside out; it reads LAT0 LAT1 LON0 LON1 with "
+                                 f"LAT0 < LAT1 and LON0 < LON1.")
+            return cls(bbox=(lat0, lat1, lon0, lon1))
+        if radius:
+            lat, lon, km = (float(v) for v in radius)
+            if km <= 0:
+                raise SystemExit(f"[ERROR] --catalog-radius km must be positive, got {km}.")
+            if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+                raise SystemExit(f"[ERROR] --catalog-radius centre {lat} {lon} is not a "
+                                 f"latitude and longitude; it reads LAT LON KM.")
+            # The enclosing box, for the entropy grid. Longitude degrees shrink
+            # with latitude, so the padding is widened by 1/cos(lat) -- clamped
+            # because at a pole the disc spans every longitude.
+            dlat = km / KM_PER_DEG_LAT
+            dlon = km / (KM_PER_DEG_LAT * max(np.cos(np.radians(lat)), 1e-6))
+            return cls(bbox=(float(max(lat - dlat, -90.0)), float(min(lat + dlat, 90.0)),
+                             float(max(lon - dlon, -180.0)), float(min(lon + dlon, 180.0))),
+                       center=(lat, lon), radius_km=km)
+        return cls(bbox=AEGEAN_BBOX)
+
+    def mask(self, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+        """Boolean mask of the events inside this region.
+
+        Args:
+            lats: Event latitudes.
+            lons: Event longitudes, same order.
+
+        Returns:
+            Boolean array, True where the event is inside.
+        """
+        if self.center is not None:
+            # A true great-circle disc, not its bounding box: at 37degN the box
+            # corner sits ~40% further out than the radius, so the difference is
+            # a fifth of the events, not a rounding detail.
+            d = haversine_km(self.center[0], self.center[1], lats, lons)
+            return d <= self.radius_km
+        lat0, lat1, lon0, lon1 = self.bbox
+        return (lats >= lat0) & (lats <= lat1) & (lons >= lon0) & (lons <= lon1)
+
+    def describe(self) -> str:
+        """One line naming this region, for the run log and the checkpoint."""
+        if self.center is not None:
+            where = (f"{self.center[0]:.4f}, {self.center[1]:.4f}"
+                     if self.station is None else
+                     f"{self.station} ({self.center[0]:.4f}, {self.center[1]:.4f})")
+            return f"{self.radius_km:g}km around {where}"
+        lat0, lat1, lon0, lon1 = self.bbox
+        default = " (Aegean default)" if self.bbox == AEGEAN_BBOX else ""
+        return f"lat {lat0:g}..{lat1:g}, lon {lon0:g}..{lon1:g}{default}"
+
+
+@lru_cache(maxsize=4)
+def _read_catalog(catalog_path: str) -> pd.DataFrame:
+    """Parses the catalogue once per path, with `dt` already decoded.
+
+    Selecting training regions measures a few hundred candidate discs, and each
+    one used to re-read and re-parse the whole CSV. On a 576k-row national
+    catalogue that is minutes of work to answer a question about geometry.
+    Parsing is pure, so the result is cached and callers filter without
+    mutating it.
+
+    Args:
+        catalog_path: Catalogue CSV with Date/Latitude/Longitude/Magnitude.
+
+    Returns:
+        The parsed catalogue. **Treat as read-only**; it is shared.
+    """
+    cat = pd.read_csv(catalog_path)
+    cat["dt"] = pd.to_datetime(cat["Date"], format="%d/%m/%Y %H:%M:%S",
+                               errors="coerce")
+    return cat
+
 
 def load_aegean_events(catalog_path: str, min_magnitude: float = 4.5,
-                       stations=None, max_dist_km: float = None) -> np.ndarray:
-    """Loads catalog events within the Aegean bounding box at or above a magnitude."""
-    cat = pd.read_csv(catalog_path)
-    cat["dt"] = pd.to_datetime(cat["Date"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
-    lat0, lat1, lon0, lon1 = AEGEAN_BBOX
-    aegean = cat[(cat.Latitude.between(lat0, lat1)) & (cat.Longitude.between(lon0, lon1)) &
-                (cat.Magnitude >= min_magnitude) & cat.dt.notna()]
-    if stations and max_dist_km:
-        aegean = aegean[station_distance_mask(aegean.Latitude.to_numpy(),
-                                            aegean.Longitude.to_numpy(),
-                                            stations, max_dist_km)]
+                       region: "Region" = None) -> np.ndarray:
+    """Loads catalog events within the study region at or above a magnitude.
+
+    Args:
+        catalog_path: Catalogue CSV with Date/Latitude/Longitude/Magnitude.
+        min_magnitude: Minimum magnitude to include.
+        region: The patch of crust to read. Defaults to the Aegean box.
+
+    Returns:
+        Sorted array of event times.
+    """
+    cat = _read_catalog(str(catalog_path))
+    aegean = cat[_inside(cat, region) & (cat.Magnitude >= min_magnitude) & cat.dt.notna()]
     return np.sort(aegean.dt.to_numpy())
 
+def _inside(cat: pd.DataFrame, region: "Region") -> pd.Series:
+    """Row mask for the catalogue rows inside `region` (the Aegean box if None)."""
+    region = region or Region(bbox=AEGEAN_BBOX)
+    return pd.Series(region.mask(cat.Latitude.to_numpy(dtype=np.float64),
+                                 cat.Longitude.to_numpy(dtype=np.float64)),
+                     index=cat.index)
+
+
 def load_aegean_events_with_location(catalog_path: str, min_magnitude: float = 3.0,
-                                     stations=None, max_dist_km: float = None):
+                                     region: "Region" = None):
     """Loads catalog events (times, magnitudes, AND lat/lon) within the Aegean bbox.
 
     Companion to `load_aegean_events_with_magnitude`, adding coordinates for
@@ -68,19 +202,14 @@ def load_aegean_events_with_location(catalog_path: str, min_magnitude: float = 3
             'Longitude', 'Magnitude' columns (data_large.csv format).
         min_magnitude: Minimum magnitude to include (completeness
             threshold for the returned "background" catalog).
+        region: The patch of crust to read. Defaults to the Aegean box.
 
     Returns:
         Tuple of (times, magnitudes, lats, lons), all sorted by time, same order.
     """
-    cat = pd.read_csv(catalog_path)
-    cat["dt"] = pd.to_datetime(cat["Date"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
-    lat0, lat1, lon0, lon1 = AEGEAN_BBOX
-    aegean = cat[(cat.Latitude.between(lat0, lat1)) & (cat.Longitude.between(lon0, lon1)) &
-                (cat.Magnitude >= min_magnitude) & cat.dt.notna()].sort_values("dt")
-    if stations and max_dist_km:
-        aegean = aegean[station_distance_mask(aegean.Latitude.to_numpy(),
-                                              aegean.Longitude.to_numpy(),
-                                              stations, max_dist_km)]
+    cat = _read_catalog(str(catalog_path))
+    aegean = cat[_inside(cat, region) & (cat.Magnitude >= min_magnitude)
+                 & cat.dt.notna()].sort_values("dt")
     return (aegean.dt.to_numpy(), aegean.Magnitude.to_numpy(dtype=np.float64),
            aegean.Latitude.to_numpy(dtype=np.float64), aegean.Longitude.to_numpy(dtype=np.float64))
 

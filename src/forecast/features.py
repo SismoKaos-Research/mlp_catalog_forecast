@@ -35,7 +35,7 @@ FEATURE_NAMES = ["log1p_dsp", "count_7d", "count_30d", "count_90d", "mean_mag_30
 
 NND_FRACTAL_DIM = 1.6  # standard Zaliapin-Ben-Zion literature default
 NND_LOOKBACK = 500  # bound the O(n*lookback) nearest-neighbour search for tractability
-ENTROPY_GRID_SIZE = 10  # 10x10 spatial cells over AEGEAN_BBOX for Shannon entropy
+ENTROPY_GRID_SIZE = 10  # 10x10 spatial cells over the study region for Shannon entropy
 
 # Trailing-rate features, for --label-mode rate. None of the features above encode
 # the trailing count of the LOW-magnitude events that define the rate target:
@@ -132,7 +132,8 @@ def _nearest_neighbor_log_eta(times, mags, lats, lons, b_value=1.0,
 
 
 def build_catalog_features(hour_index, major_times, dsp, bg_times=None, bg_mags=None,
-                           bg_min_mag=3.0, bg_lats=None, bg_lons=None) -> np.ndarray:
+                           bg_min_mag=3.0, bg_lats=None, bg_lons=None,
+                           grid_bbox=None) -> np.ndarray:
     """Per-hour backward-looking catalog features -- no leakage.
 
     Timing features (0-3) come from `major_times` (the M>=threshold set
@@ -165,6 +166,12 @@ def build_catalog_features(hour_index, major_times, dsp, bg_times=None, bg_mags=
         bg_lats: Matching latitudes for `bg_times`, same order (see
             `load_aegean_events_with_location`). Optional.
         bg_lons: Matching longitudes for `bg_times`, same order. Optional.
+        grid_bbox: Extent (lat0, lat1, lon0, lon1) the spatial Shannon entropy
+            bins over. Defaults to the Aegean box, which is what the published
+            figures used. A run restricted to a smaller region must pass that
+            region's box: a grid still spanning the whole Aegean would drop all
+            of its events into two or three cells and report the same entropy
+            every hour.
 
     Returns:
         float32 array, shape (n_hours, CATALOG_DIM).
@@ -180,7 +187,7 @@ def build_catalog_features(hour_index, major_times, dsp, bg_times=None, bg_mags=
         b_value_global = (1.0 / LN10) / mean_excess_global
         nnd_log_eta = _nearest_neighbor_log_eta(bg_times, bg_mags, bg_lats, bg_lons,
                                                 b_value=b_value_global)
-        lat0, lat1, lon0, lon1 = 36.0, 40.0, 25.0, 30.0  # AEGEAN_BBOX
+        lat0, lat1, lon0, lon1 = grid_bbox or (36.0, 40.0, 25.0, 30.0)  # AEGEAN_BBOX
 
     t = hour_index.to_numpy()
     feat = np.zeros((len(t), CATALOG_DIM), dtype=np.float32)

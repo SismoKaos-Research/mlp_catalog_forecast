@@ -12,8 +12,25 @@ import pandas as pd
 
 def print_split_diagnostics(hourly_index: pd.DatetimeIndex, labels: np.ndarray,
                             train_idx: np.ndarray, val_idx: np.ndarray, test_idx: np.ndarray,
-                            n_blocks: int = 10, skew_ratio: float = 1.5) -> None:
-    """Positive rate over time in `n_blocks` equal-width windows."""
+                            n_blocks: int = 10, skew_ratio: float = 1.5,
+                            major_times: np.ndarray = None) -> None:
+    """Positive rate over time in `n_blocks` equal-width windows.
+
+    Args:
+        hourly_index: DatetimeIndex of hour starts.
+        labels: Per-hour binary labels.
+        train_idx: Window end-indices of the train split.
+        val_idx: Window end-indices of the val split.
+        test_idx: Window end-indices of the test split.
+        n_blocks: Equal-width windows to report the positive rate over.
+        skew_ratio: Test/train positive-rate ratio that triggers the warning.
+        major_times: Sorted qualifying event times. When given, each split's
+            distinct event count is printed beside its sample count -- that is
+            the split's effective sample size, and it is the number a result
+            actually rests on. At a 14-day horizon one event turns 336
+            consecutive hours positive, so a split of 32448 rows can be ten
+            earthquakes.
+    """
     n = len(hourly_index)
     edges = np.linspace(0, n, n_blocks + 1).astype(int)
     split_of = np.full(n, "", dtype=object)
@@ -31,6 +48,28 @@ def print_split_diagnostics(hourly_index: pd.DatetimeIndex, labels: np.ndarray,
         dominant = pd.Series(present).mode().iloc[0] if len(present) else "-"
         print(f"    {hourly_index[lo].date()} .. {hourly_index[hi - 1].date()}  "
                f"pos rate {labels[lo:hi].mean():.3f}  n={hi - lo:4d}  split~{dominant}")
+
+    if major_times is not None and len(major_times):
+        print("\n  effective sample size (distinct events, not rows):")
+        for name, idx in (("train", train_idx), ("val", val_idx), ("test", test_idx)):
+            if not len(idx):
+                continue
+            lo = hourly_index[idx[0]].to_datetime64()
+            hi = hourly_index[idx[-1]].to_datetime64()
+            k = int(np.sum((major_times >= lo) & (major_times <= hi)))
+            print(f"    {name:5s}: {len(idx):>6} samples, {k:>4} distinct events")
+            if name == "test" and k < 30:
+                # Hanley-McNeil is not worth computing here, but the order of
+                # magnitude is: at k positives the AUC's standard error is around
+                # 0.5/sqrt(k), which at k=10 is ~0.16 and swamps every gap this
+                # project reports between a model and its floor.
+                if k == 0:
+                    print("    [!] no qualifying events in the test block at all "
+                          "-- its AUC is undefined, not low.")
+                else:
+                    print(f"    [!] a test AUC over {k} events carries roughly "
+                          f"+/-{0.5 / np.sqrt(k):.2f}. Read the fold-versus-floor "
+                          f"verdict, not the third decimal.")
 
     rates = {name: labels[idx].mean() for name, idx in
              (("train", train_idx), ("val", val_idx), ("test", test_idx)) if len(idx)}
