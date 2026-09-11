@@ -12,4 +12,6 @@ wheels/
 # Run outputs
 runs/
 *.pth
+*.pt
 logs/
+trained_model*/
